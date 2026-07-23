@@ -32,7 +32,7 @@ import java.util.concurrent.ThreadLocalRandom;
 
 @ScriptManifest(name = "Fletching Profit", gameType = GameType.OS)
 public class FletchingProfitScript extends Script {
-    private static final String SCRIPT_VERSION = "v0.2.3-confirm-make-click";
+    private static final String SCRIPT_VERSION = "v0.2.4-direct-make-widget";
     private static final Tile GRAND_EXCHANGE_TILE = new Tile(3164, 3487, 0);
     private static final int GE_MIN_X = 3150;
     private static final int GE_MAX_X = 3190;
@@ -48,6 +48,8 @@ public class FletchingProfitScript extends Script {
     private static final String COINS = "Coins";
     private static final String BOW_STRING = "Bow string";
     private static final String[] CUTTING_TOOLS = {"Fletching knife", "Knife"};
+    private static final int MAKE_INTERFACE_GROUP = 270;
+    private static final int MAKE_PRIMARY_ITEM_CHILD = 15;
 
     private final Queue<GeAction> pendingGeActions = new ArrayDeque<>();
     private final List<GeAction> placedGeActions = new ArrayList<>();
@@ -786,6 +788,10 @@ public class FletchingProfitScript extends Script {
 
         stats.setStatus("Selecting creation target: " + output);
         clickMakeAllQuantity(ctx);
+        if (clickDirectMakeWidget(ctx, recipe, stage, beforeActions, beforeOutput)) {
+            return true;
+        }
+
         for (String action : makeActions(target)) {
             if (target.interact(action, output)
                     || target.interact(action)
@@ -813,6 +819,43 @@ public class FletchingProfitScript extends Script {
             logMakeClickFailure(ctx, recipe, stage, target);
         }
         return clicked;
+    }
+
+    private boolean clickDirectMakeWidget(
+            APIContext ctx,
+            FletchingRecipe recipe,
+            WorkStage stage,
+            int beforeActions,
+            int beforeOutput
+    ) {
+        if (stage != WorkStage.STRING) {
+            return false;
+        }
+
+        WidgetChild direct = ctx.widgets().get(MAKE_INTERFACE_GROUP, MAKE_PRIMARY_ITEM_CHILD);
+        if (!isVisibleWidget(direct)) {
+            return false;
+        }
+
+        int expectedItemId = stageOutputItemId(recipe, stage);
+        if (direct.getItemId() > 0 && direct.getItemId() != expectedItemId) {
+            log("Widget 270.15 visible, but item id is " + direct.getItemId()
+                    + " instead of expected " + expectedItemId + " for " + recipe.label);
+        }
+
+        stats.setStatus("Clicking make widget 270.15 for " + recipe.label);
+        for (int attempt = 0; attempt < 4; attempt++) {
+            Point point = randomWidgetPoint(direct);
+            if (point != null && ctx.mouse().click(point, false)
+                    && waitForCreationStart(ctx, recipe, stage, beforeActions, beforeOutput)) {
+                return true;
+            }
+            closeOpenMenu(ctx);
+            Time.sleep(200, 380);
+        }
+
+        logMakeClickFailure(ctx, recipe, stage, direct);
+        return false;
     }
 
     private boolean waitForCreationStart(
@@ -905,6 +948,12 @@ public class FletchingProfitScript extends Script {
     private WidgetChild findMakeWidget(APIContext ctx, FletchingRecipe recipe, WorkStage stage) {
         String outputName = stageOutput(recipe, stage);
         int outputItemId = stageOutputItemId(recipe, stage);
+        WidgetChild direct = ctx.widgets().get(MAKE_INTERFACE_GROUP, MAKE_PRIMARY_ITEM_CHILD);
+        if (stage == WorkStage.STRING
+                && isVisibleWidget(direct)) {
+            return direct;
+        }
+
         List<WidgetChild> makeItemWidgets = makeInterfaceItemWidgets(ctx);
         if (outputItemId > 0) {
             for (WidgetChild widget : makeItemWidgets) {
