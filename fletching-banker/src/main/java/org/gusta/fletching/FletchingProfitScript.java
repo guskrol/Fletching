@@ -32,7 +32,7 @@ import java.util.concurrent.ThreadLocalRandom;
 
 @ScriptManifest(name = "Fletching Profit", gameType = GameType.OS)
 public class FletchingProfitScript extends Script {
-    private static final String SCRIPT_VERSION = "v0.2.2-random-inventory-use";
+    private static final String SCRIPT_VERSION = "v0.2.3-confirm-make-click";
     private static final Tile GRAND_EXCHANGE_TILE = new Tile(3164, 3487, 0);
     private static final int GE_MIN_X = 3150;
     private static final int GE_MAX_X = 3190;
@@ -577,7 +577,7 @@ public class FletchingProfitScript extends Script {
                         || ctx.inventory().getCount(true, output) > beforeOutput,
                 100);
 
-        if (makeInterfaceOpen(ctx) && !clickMakeTarget(ctx, recipe, stage)) {
+        if (makeInterfaceOpen(ctx) && !clickMakeTarget(ctx, recipe, stage, beforeActions, beforeOutput)) {
             stats.setStatus("Creation menu open, but target not found: " + output);
             Time.sleep(1000, 1600);
             return;
@@ -724,6 +724,13 @@ public class FletchingProfitScript extends Script {
         return clicked;
     }
 
+    private void closeOpenMenu(APIContext ctx) {
+        if (ctx.menu().isOpen()) {
+            ctx.menu().closeMenu();
+            Time.sleep(120, 260, () -> !ctx.menu().isOpen(), 50);
+        }
+    }
+
     private ItemWidget randomInventoryItem(APIContext ctx, String itemName) {
         List<ItemWidget> candidates = new ArrayList<>();
         for (ItemWidget item : ctx.inventory().getItems(itemName)) {
@@ -763,7 +770,13 @@ public class FletchingProfitScript extends Script {
         );
     }
 
-    private boolean clickMakeTarget(APIContext ctx, FletchingRecipe recipe, WorkStage stage) {
+    private boolean clickMakeTarget(
+            APIContext ctx,
+            FletchingRecipe recipe,
+            WorkStage stage,
+            int beforeActions,
+            int beforeOutput
+    ) {
         String output = stageOutput(recipe, stage);
         WidgetChild target = findMakeWidget(ctx, recipe, stage);
         if (target == null) {
@@ -772,27 +785,103 @@ public class FletchingProfitScript extends Script {
         }
 
         stats.setStatus("Selecting creation target: " + output);
+        clickMakeAllQuantity(ctx);
         for (String action : makeActions(target)) {
             if (target.interact(action, output)
                     || target.interact(action)
                     || ctx.menu().interact(action, output, target, true)
                     || ctx.menu().interact(action, target, true)) {
-                Time.sleep(700, 1200);
-                return true;
+                if (waitForCreationStart(ctx, recipe, stage, beforeActions, beforeOutput)) {
+                    return true;
+                }
+                closeOpenMenu(ctx);
             }
         }
 
-        Point point = target.getCentralPoint();
-        if (point != null && ctx.mouse().click(point, false)) {
-            Time.sleep(700, 1200);
-            return true;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            Point point = randomWidgetPoint(target);
+            if (point != null && ctx.mouse().click(point, false)
+                    && waitForCreationStart(ctx, recipe, stage, beforeActions, beforeOutput)) {
+                return true;
+            }
+            closeOpenMenu(ctx);
+            Time.sleep(250, 450);
         }
 
-        if (target.click()) {
-            Time.sleep(700, 1200);
+        boolean clicked = target.click() && waitForCreationStart(ctx, recipe, stage, beforeActions, beforeOutput);
+        if (!clicked) {
+            logMakeClickFailure(ctx, recipe, stage, target);
+        }
+        return clicked;
+    }
+
+    private boolean waitForCreationStart(
+            APIContext ctx,
+            FletchingRecipe recipe,
+            WorkStage stage,
+            int beforeActions,
+            int beforeOutput
+    ) {
+        String output = stageOutput(recipe, stage);
+        Time.sleep(650, 1300,
+                () -> !makeInterfaceOpen(ctx)
+                        || ctx.localPlayer().isAnimating()
+                        || inventoryActionCount(ctx, recipe, stage) < beforeActions
+                        || ctx.inventory().getCount(true, output) > beforeOutput,
+                50);
+        return !makeInterfaceOpen(ctx)
+                || ctx.localPlayer().isAnimating()
+                || inventoryActionCount(ctx, recipe, stage) < beforeActions
+                || ctx.inventory().getCount(true, output) > beforeOutput;
+    }
+
+    private boolean clickMakeAllQuantity(APIContext ctx) {
+        WidgetChild all = findMakeQuantityWidget(ctx, "All");
+        if (all == null) {
+            return false;
+        }
+        Point point = randomWidgetPoint(all);
+        if (point != null && ctx.mouse().click(point, false)) {
+            Time.sleep(180, 350);
+            return true;
+        }
+        if (all.interact("Select") || all.interact("All") || all.click()) {
+            Time.sleep(180, 350);
             return true;
         }
         return false;
+    }
+
+    private WidgetChild findMakeQuantityWidget(APIContext ctx, String quantityText) {
+        String expected = normalizedName(quantityText);
+        for (WidgetChild widget : ctx.widgets().getAllChildren(this::isVisibleWidget)) {
+            if (!isInMakePanel(ctx, widget)) {
+                continue;
+            }
+            String text = normalizedName(visibleText(widget));
+            if (expected.equals(text) || text.endsWith(expected)) {
+                return widget;
+            }
+        }
+        return null;
+    }
+
+    private void logMakeClickFailure(APIContext ctx, FletchingRecipe recipe, WorkStage stage, WidgetChild target) {
+        long now = System.currentTimeMillis();
+        if (now < nextMakeWidgetDebugAt) {
+            return;
+        }
+
+        log("Make target click did not start " + stageLabel(stage)
+                + " for " + recipe.label
+                + ". targetId=" + target.getItemId()
+                + " bounds=" + target.getBounds()
+                + " actions=" + target.getActions()
+                + " text='" + cleanWidgetText(visibleText(target)) + "'"
+                + " makeOpen=" + makeInterfaceOpen(ctx)
+                + " animating=" + ctx.localPlayer().isAnimating()
+                + " actionsLeft=" + inventoryActionCount(ctx, recipe, stage));
+        nextMakeWidgetDebugAt = now + 8_000L;
     }
 
     private List<String> makeActions(WidgetChild widget) {
@@ -911,7 +1000,7 @@ public class FletchingProfitScript extends Script {
     private Rectangle makePanelBounds(APIContext ctx) {
         int canvasWidth = Math.max(1, ctx.client().getCanvasWidth());
         int canvasHeight = Math.max(1, ctx.client().getCanvasHeight());
-        return new Rectangle(0, Math.max(0, canvasHeight - 260), Math.min(canvasWidth, 580), 260);
+        return new Rectangle(0, Math.max(0, canvasHeight - 330), Math.min(canvasWidth, 580), 330);
     }
 
     private void logMakeWidgetFailure(APIContext ctx, FletchingRecipe recipe, WorkStage stage, String output) {
@@ -1343,6 +1432,26 @@ public class FletchingProfitScript extends Script {
         }
         Point point = widget.getCentralPoint();
         return point != null && ctx.mouse().click(point, false);
+    }
+
+    private Point randomWidgetPoint(WidgetChild widget) {
+        if (!isVisibleWidget(widget)) {
+            return null;
+        }
+        Rectangle bounds = widget.getBounds();
+        if (bounds == null || bounds.width <= 0 || bounds.height <= 0) {
+            return widget.getCentralPoint();
+        }
+        int marginX = Math.min(6, Math.max(0, bounds.width / 5));
+        int marginY = Math.min(6, Math.max(0, bounds.height / 5));
+        int minX = bounds.x + marginX;
+        int maxX = Math.max(minX, bounds.x + bounds.width - marginX - 1);
+        int minY = bounds.y + marginY;
+        int maxY = Math.max(minY, bounds.y + bounds.height - marginY - 1);
+        return new Point(
+                ThreadLocalRandom.current().nextInt(minX, maxX + 1),
+                ThreadLocalRandom.current().nextInt(minY, maxY + 1)
+        );
     }
 
     private boolean isVisibleWidget(WidgetChild widget) {
