@@ -1,0 +1,14 @@
+# Ignore Gradle project-specific cache directory
+.gradle
+
+# build output directory
+build
+bin
+
+# IDE IntelliJ
+.idea
+
+# IDE Eclipse
+.settings
+.classpath
+.project
