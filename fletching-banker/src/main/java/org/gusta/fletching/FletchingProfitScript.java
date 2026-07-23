@@ -24,13 +24,15 @@ import java.awt.Rectangle;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ThreadLocalRandom;
 
 @ScriptManifest(name = "Fletching Profit", gameType = GameType.OS)
 public class FletchingProfitScript extends Script {
-    private static final String SCRIPT_VERSION = "v0.2.0-pipeline-restock";
+    private static final String SCRIPT_VERSION = "v0.2.2-random-inventory-use";
     private static final Tile GRAND_EXCHANGE_TILE = new Tile(3164, 3487, 0);
     private static final int GE_MIN_X = 3150;
     private static final int GE_MAX_X = 3190;
@@ -49,6 +51,7 @@ public class FletchingProfitScript extends Script {
 
     private final Queue<GeAction> pendingGeActions = new ArrayDeque<>();
     private final List<GeAction> placedGeActions = new ArrayList<>();
+    private final Map<String, Integer> lastInventoryUseIndexByName = new HashMap<>();
     private final Pricing pricing = new Pricing();
 
     private Stats stats;
@@ -57,6 +60,7 @@ public class FletchingProfitScript extends Script {
     private long nextRecipeRefreshAt;
     private long nextGeCollectAt;
     private long nextIdleLogAt;
+    private long nextMakeWidgetDebugAt;
     private boolean stoppedForNoProfit;
 
     @Override
@@ -242,6 +246,18 @@ public class FletchingProfitScript extends Script {
             return;
         }
 
+        if (inventoryPartialForStringing(ctx, recipe)
+                && hasStringingMaterialsAvailable(ctx, recipe)
+                && prepareStringingInventory(ctx, recipe)) {
+            return;
+        }
+
+        if (inventoryPartialForCutting(ctx, recipe)
+                && hasLogsAvailable(ctx, recipe)
+                && prepareCuttingInventory(ctx, recipe)) {
+            return;
+        }
+
         if (hasLogsAvailable(ctx, recipe) && prepareCuttingInventory(ctx, recipe)) {
             return;
         }
@@ -265,7 +281,10 @@ public class FletchingProfitScript extends Script {
             return true;
         }
 
-        if (inventoryReadyForCutting(ctx, recipe) || inventoryReadyForStringing(ctx, recipe)) {
+        if (inventoryReadyForCutting(ctx, recipe)
+                || inventoryReadyForStringing(ctx, recipe)
+                || inventoryPartialForCutting(ctx, recipe)
+                || inventoryPartialForStringing(ctx, recipe)) {
             return false;
         }
 
@@ -629,29 +648,35 @@ public class FletchingProfitScript extends Script {
     private boolean selectInventoryItemForUse(APIContext ctx, String itemName) {
         clearInventoryInteractionState(ctx);
 
-        if (ctx.inventory().selectItem(itemName)) {
+        ItemWidget item = randomInventoryItem(ctx, itemName);
+        if (item != null) {
+            boolean interacted = item.interact("Use", itemName) || item.interact("Use");
             Time.sleep(250, 700, () -> ctx.inventory().isItemSelected() || ctx.menu().isOpen(), 50);
             if (ctx.inventory().isItemSelected()) {
                 return true;
             }
+            if (ctx.menu().isOpen() && selectUseFromOpenMenu(ctx, itemName)) {
+                return true;
+            }
+
+            Point point = inventoryItemPoint(item);
+            boolean clicked = point != null && ctx.mouse().click(point, false);
+            Time.sleep(250, 700, () -> ctx.inventory().isItemSelected() || ctx.menu().isOpen(), 50);
+            if (ctx.menu().isOpen()) {
+                return selectUseFromOpenMenu(ctx, itemName);
+            }
+            if (clicked && ctx.inventory().isItemSelected()) {
+                return true;
+            }
+            if (interacted && ctx.inventory().isItemSelected()) {
+                return true;
+            }
         }
 
-        if (ctx.menu().isOpen() && selectUseFromOpenMenu(ctx, itemName)) {
-            return true;
+        if (ctx.inventory().selectItem(itemName)) {
+            Time.sleep(250, 700, () -> ctx.inventory().isItemSelected() || ctx.menu().isOpen(), 50);
         }
-
-        ItemWidget item = ctx.inventory().getItem(itemName);
-        if (item == null || !item.isValid()) {
-            return false;
-        }
-
-        Point point = inventoryItemCenter(item);
-        boolean clicked = point != null && ctx.mouse().click(point, false);
-        Time.sleep(250, 700, () -> ctx.inventory().isItemSelected() || ctx.menu().isOpen(), 50);
-        if (ctx.menu().isOpen()) {
-            return selectUseFromOpenMenu(ctx, itemName);
-        }
-        return clicked && ctx.inventory().isItemSelected();
+        return ctx.inventory().isItemSelected();
     }
 
     private boolean useSelectedItemOnInventoryItem(APIContext ctx, String itemName) {
@@ -663,12 +688,12 @@ public class FletchingProfitScript extends Script {
             Time.sleep(150, 300);
         }
 
-        ItemWidget item = ctx.inventory().getItem(itemName);
+        ItemWidget item = randomInventoryItem(ctx, itemName);
         if (item == null || !item.isValid()) {
             return false;
         }
 
-        Point point = inventoryItemCenter(item);
+        Point point = inventoryItemPoint(item);
         boolean clicked = point != null && ctx.mouse().click(point, false);
         Time.sleep(350, 1000, () -> !ctx.inventory().isItemSelected() || ctx.menu().isOpen(), 50);
         if (ctx.menu().isOpen()) {
@@ -699,18 +724,50 @@ public class FletchingProfitScript extends Script {
         return clicked;
     }
 
-    private Point inventoryItemCenter(ItemWidget item) {
+    private ItemWidget randomInventoryItem(APIContext ctx, String itemName) {
+        List<ItemWidget> candidates = new ArrayList<>();
+        for (ItemWidget item : ctx.inventory().getItems(itemName)) {
+            if (item != null && item.isValid()) {
+                candidates.add(item);
+            }
+        }
+        if (candidates.isEmpty()) {
+            return null;
+        }
+
+        String key = normalizedName(itemName);
+        Integer lastIndex = lastInventoryUseIndexByName.get(key);
+        if (lastIndex != null && candidates.size() > 1) {
+            candidates.removeIf(item -> item.getIndex() == lastIndex);
+        }
+
+        ItemWidget selected = candidates.get(ThreadLocalRandom.current().nextInt(candidates.size()));
+        lastInventoryUseIndexByName.put(key, selected.getIndex());
+        return selected;
+    }
+
+    private Point inventoryItemPoint(ItemWidget item) {
         Rectangle bounds = item.getBounds();
         if (bounds == null || bounds.width <= 0 || bounds.height <= 0) {
             return null;
         }
-        return new Point(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+        int marginX = Math.min(5, Math.max(0, bounds.width / 4));
+        int marginY = Math.min(5, Math.max(0, bounds.height / 4));
+        int minX = bounds.x + marginX;
+        int maxX = Math.max(minX, bounds.x + bounds.width - marginX - 1);
+        int minY = bounds.y + marginY;
+        int maxY = Math.max(minY, bounds.y + bounds.height - marginY - 1);
+        return new Point(
+                ThreadLocalRandom.current().nextInt(minX, maxX + 1),
+                ThreadLocalRandom.current().nextInt(minY, maxY + 1)
+        );
     }
 
     private boolean clickMakeTarget(APIContext ctx, FletchingRecipe recipe, WorkStage stage) {
         String output = stageOutput(recipe, stage);
         WidgetChild target = findMakeWidget(ctx, recipe, stage);
         if (target == null) {
+            logMakeWidgetFailure(ctx, recipe, stage, output);
             return false;
         }
 
@@ -758,12 +815,22 @@ public class FletchingProfitScript extends Script {
 
     private WidgetChild findMakeWidget(APIContext ctx, FletchingRecipe recipe, WorkStage stage) {
         String outputName = stageOutput(recipe, stage);
+        int outputItemId = stageOutputItemId(recipe, stage);
+        List<WidgetChild> makeItemWidgets = makeInterfaceItemWidgets(ctx);
+        if (outputItemId > 0) {
+            for (WidgetChild widget : makeItemWidgets) {
+                if (widget.getItemId() == outputItemId) {
+                    return widget;
+                }
+            }
+        }
+
         WidgetChild named = ctx.widgets()
                 .query()
                 .itemName(outputName)
                 .results()
                 .first();
-        if (isVisibleWidget(named)) {
+        if (isVisibleWidget(named) && isInMakePanel(ctx, named)) {
             return named;
         }
 
@@ -776,9 +843,16 @@ public class FletchingProfitScript extends Script {
             String combined = normalizedName(widget.getName())
                     + " " + normalizedName(widget.getText())
                     + " " + normalizedName(widget.getRawText());
-            if (combined.contains(output) || (!label.isBlank() && combined.contains(label))) {
+            if (widget.getItemId() == outputItemId
+                    || combined.contains(output)
+                    || (!label.isBlank() && combined.contains(label))) {
                 return widget;
             }
+        }
+
+        WidgetChild positional = findMakeWidgetByPosition(ctx, recipe, stage, makeItemWidgets);
+        if (positional != null) {
+            return positional;
         }
 
         List<WidgetChild> makeWidgets = new ArrayList<>();
@@ -788,6 +862,78 @@ public class FletchingProfitScript extends Script {
             }
         }
         return makeWidgets.size() == 1 ? makeWidgets.get(0) : null;
+    }
+
+    private WidgetChild findMakeWidgetByPosition(
+            APIContext ctx,
+            FletchingRecipe recipe,
+            WorkStage stage,
+            List<WidgetChild> itemWidgets
+    ) {
+        if (itemWidgets.isEmpty()) {
+            return null;
+        }
+
+        if (stage == WorkStage.STRING && itemWidgets.size() == 1) {
+            return itemWidgets.get(0);
+        }
+
+        int index = stage == WorkStage.CUT ? recipe.cutOptionIndex() : 0;
+        if (index >= 0 && index < itemWidgets.size()) {
+            return itemWidgets.get(index);
+        }
+        return null;
+    }
+
+    private List<WidgetChild> makeInterfaceItemWidgets(APIContext ctx) {
+        Rectangle makePanel = makePanelBounds(ctx);
+        List<WidgetChild> widgets = new ArrayList<>();
+        for (WidgetChild widget : ctx.widgets().getAllChildren(this::isVisibleWidget)) {
+            if (widget.getItemId() <= 0) {
+                continue;
+            }
+            Point point = widget.getCentralPoint();
+            if (point != null && makePanel.contains(point)) {
+                widgets.add(widget);
+            }
+        }
+        widgets.sort(Comparator
+                .comparingInt((WidgetChild widget) -> widget.getBounds().y)
+                .thenComparingInt(widget -> widget.getBounds().x));
+        return widgets;
+    }
+
+    private boolean isInMakePanel(APIContext ctx, WidgetChild widget) {
+        Point point = widget == null ? null : widget.getCentralPoint();
+        return point != null && makePanelBounds(ctx).contains(point);
+    }
+
+    private Rectangle makePanelBounds(APIContext ctx) {
+        int canvasWidth = Math.max(1, ctx.client().getCanvasWidth());
+        int canvasHeight = Math.max(1, ctx.client().getCanvasHeight());
+        return new Rectangle(0, Math.max(0, canvasHeight - 260), Math.min(canvasWidth, 580), 260);
+    }
+
+    private void logMakeWidgetFailure(APIContext ctx, FletchingRecipe recipe, WorkStage stage, String output) {
+        long now = System.currentTimeMillis();
+        if (now < nextMakeWidgetDebugAt) {
+            return;
+        }
+
+        List<String> parts = new ArrayList<>();
+        for (WidgetChild widget : makeInterfaceItemWidgets(ctx)) {
+            parts.add("id=" + widget.getItemId()
+                    + " bounds=" + widget.getBounds()
+                    + " actions=" + widget.getActions()
+                    + " text='" + cleanWidgetText(widget.getText()) + "'");
+        }
+
+        log("Make target not found for " + stageLabel(stage)
+                + " output=" + output
+                + " expectedId=" + stageOutputItemId(recipe, stage)
+                + " optionIndex=" + (stage == WorkStage.CUT ? recipe.cutOptionIndex() : 0)
+                + " makeItems=[" + String.join("; ", parts) + "]");
+        nextMakeWidgetDebugAt = now + 8_000L;
     }
 
     private boolean looksLikeMakeWidget(WidgetChild widget) {
@@ -1030,6 +1176,17 @@ public class FletchingProfitScript extends Script {
                 && inventoryOnlyContains(ctx, recipe.unstrung, BOW_STRING);
     }
 
+    private boolean inventoryPartialForCutting(APIContext ctx, FletchingRecipe recipe) {
+        return inventoryOnlyContains(ctx, recipe.logs, CUTTING_TOOLS[0], CUTTING_TOOLS[1])
+                && (ctx.inventory().getCount(recipe.logs) > 0 || hasAnyCuttingTool(ctx));
+    }
+
+    private boolean inventoryPartialForStringing(APIContext ctx, FletchingRecipe recipe) {
+        return inventoryOnlyContains(ctx, recipe.unstrung, BOW_STRING)
+                && (ctx.inventory().getCount(recipe.unstrung) > 0
+                || ctx.inventory().getCount(BOW_STRING) > 0);
+    }
+
     private int inventoryActionCount(APIContext ctx, FletchingRecipe recipe, WorkStage stage) {
         if (stage == WorkStage.CUT) {
             return ctx.inventory().getCount(recipe.logs);
@@ -1064,6 +1221,16 @@ public class FletchingProfitScript extends Script {
             return recipe.output;
         }
         return recipe.output;
+    }
+
+    private int stageOutputItemId(FletchingRecipe recipe, WorkStage stage) {
+        if (stage == WorkStage.CUT) {
+            return recipe.unstrungId;
+        }
+        if (stage == WorkStage.STRING) {
+            return recipe.outputId;
+        }
+        return recipe.outputId;
     }
 
     private String stageLabel(WorkStage stage) {
@@ -1273,7 +1440,9 @@ public class FletchingProfitScript extends Script {
         private final String plainLabel;
         private final String logs;
         private final String unstrung;
+        private final int unstrungId;
         private final String output;
+        private final int outputId;
         private final double stepXp;
         private final int cutXpPerHour;
         private final int stringXpPerHour;
@@ -1284,7 +1453,9 @@ public class FletchingProfitScript extends Script {
                 String plainLabel,
                 String logs,
                 String unstrung,
+                int unstrungId,
                 String output,
+                int outputId,
                 double stepXp,
                 int cutXpPerHour,
                 int stringXpPerHour
@@ -1294,7 +1465,9 @@ public class FletchingProfitScript extends Script {
             this.plainLabel = plainLabel;
             this.logs = logs;
             this.unstrung = unstrung;
+            this.unstrungId = unstrungId;
             this.output = output;
+            this.outputId = outputId;
             this.stepXp = stepXp;
             this.cutXpPerHour = cutXpPerHour;
             this.stringXpPerHour = stringXpPerHour;
@@ -1302,18 +1475,18 @@ public class FletchingProfitScript extends Script {
 
         private static List<FletchingRecipe> all() {
             return List.of(
-                    pipeline(5, "Shortbow", "Shortbow", "Logs", "Shortbow (u)", "Shortbow", 5.0D, 13_500, 12_250),
-                    pipeline(10, "Longbow", "Longbow", "Logs", "Longbow (u)", "Longbow", 10.0D, 27_000, 24_500),
-                    pipeline(20, "Oak shortbow", "Oak shortbow", "Oak logs", "Oak shortbow (u)", "Oak shortbow", 16.5D, 44_550, 40_425),
-                    pipeline(25, "Oak longbow", "Oak longbow", "Oak logs", "Oak longbow (u)", "Oak longbow", 25.0D, 67_500, 61_250),
-                    pipeline(35, "Willow shortbow", "Willow shortbow", "Willow logs", "Willow shortbow (u)", "Willow shortbow", 33.3D, 89_910, 81_585),
-                    pipeline(40, "Willow longbow", "Willow longbow", "Willow logs", "Willow longbow (u)", "Willow longbow", 41.5D, 112_050, 101_675),
-                    pipeline(50, "Maple shortbow", "Maple shortbow", "Maple logs", "Maple shortbow (u)", "Maple shortbow", 50.0D, 135_000, 122_500),
-                    pipeline(55, "Maple longbow", "Maple longbow", "Maple logs", "Maple longbow (u)", "Maple longbow", 58.3D, 157_410, 142_835),
-                    pipeline(65, "Yew shortbow", "Yew shortbow", "Yew logs", "Yew shortbow (u)", "Yew shortbow", 67.5D, 182_250, 165_375),
-                    pipeline(70, "Yew longbow", "Yew longbow", "Yew logs", "Yew longbow (u)", "Yew longbow", 75.0D, 202_500, 183_750),
-                    pipeline(80, "Magic shortbow", "Magic shortbow", "Magic logs", "Magic shortbow (u)", "Magic shortbow", 83.3D, 224_910, 203_350),
-                    pipeline(85, "Magic longbow", "Magic longbow", "Magic logs", "Magic longbow (u)", "Magic longbow", 91.5D, 247_050, 224_175)
+                    pipeline(5, "Shortbow", "Shortbow", "Logs", "Shortbow (u)", 50, "Shortbow", 841, 5.0D, 13_500, 12_250),
+                    pipeline(10, "Longbow", "Longbow", "Logs", "Longbow (u)", 48, "Longbow", 839, 10.0D, 27_000, 24_500),
+                    pipeline(20, "Oak shortbow", "Oak shortbow", "Oak logs", "Oak shortbow (u)", 54, "Oak shortbow", 843, 16.5D, 44_550, 40_425),
+                    pipeline(25, "Oak longbow", "Oak longbow", "Oak logs", "Oak longbow (u)", 56, "Oak longbow", 845, 25.0D, 67_500, 61_250),
+                    pipeline(35, "Willow shortbow", "Willow shortbow", "Willow logs", "Willow shortbow (u)", 60, "Willow shortbow", 849, 33.3D, 89_910, 81_585),
+                    pipeline(40, "Willow longbow", "Willow longbow", "Willow logs", "Willow longbow (u)", 58, "Willow longbow", 847, 41.5D, 112_050, 101_675),
+                    pipeline(50, "Maple shortbow", "Maple shortbow", "Maple logs", "Maple shortbow (u)", 64, "Maple shortbow", 853, 50.0D, 135_000, 122_500),
+                    pipeline(55, "Maple longbow", "Maple longbow", "Maple logs", "Maple longbow (u)", 62, "Maple longbow", 851, 58.3D, 157_410, 142_835),
+                    pipeline(65, "Yew shortbow", "Yew shortbow", "Yew logs", "Yew shortbow (u)", 68, "Yew shortbow", 857, 67.5D, 182_250, 165_375),
+                    pipeline(70, "Yew longbow", "Yew longbow", "Yew logs", "Yew longbow (u)", 66, "Yew longbow", 855, 75.0D, 202_500, 183_750),
+                    pipeline(80, "Magic shortbow", "Magic shortbow", "Magic logs", "Magic shortbow (u)", 72, "Magic shortbow", 861, 83.3D, 224_910, 203_350),
+                    pipeline(85, "Magic longbow", "Magic longbow", "Magic logs", "Magic longbow (u)", 70, "Magic longbow", 859, 91.5D, 247_050, 224_175)
             );
         }
 
@@ -1323,7 +1496,9 @@ public class FletchingProfitScript extends Script {
                 String plainLabel,
                 String logs,
                 String unstrung,
+                int unstrungId,
                 String output,
+                int outputId,
                 double stepXp,
                 int cutXpPerHour,
                 int stringXpPerHour
@@ -1334,11 +1509,17 @@ public class FletchingProfitScript extends Script {
                     plainLabel,
                     logs,
                     unstrung,
+                    unstrungId,
                     output,
+                    outputId,
                     stepXp,
                     cutXpPerHour,
                     stringXpPerHour
             );
+        }
+
+        private int cutOptionIndex() {
+            return normalizedStatic(label).contains("longbow") ? 2 : 1;
         }
 
         private long completedBowsPerHour() {
@@ -1349,6 +1530,14 @@ public class FletchingProfitScript extends Script {
 
         private double totalXpPerBow() {
             return stepXp * 2.0D;
+        }
+
+        private static String normalizedStatic(String value) {
+            return value == null
+                    ? ""
+                    : value.replaceAll("<[^>]+>", " ")
+                    .toLowerCase()
+                    .replaceAll("[^a-z0-9]", "");
         }
     }
 
