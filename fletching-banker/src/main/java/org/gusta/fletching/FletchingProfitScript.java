@@ -192,28 +192,37 @@ public class FletchingProfitScript extends Script {
             }
         }
 
-        Quote best = quotes.stream()
+        Quote bestProfitable = quotes.stream()
                 .filter(quote -> quote.profitPerAction > 0)
                 .max(Comparator.comparingLong(quote -> quote.profitPerHour))
+                .orElse(null);
+
+        Quote best = bestProfitable != null
+                ? bestProfitable
+                : quotes.stream()
+                .max(Comparator
+                        .comparingLong((Quote quote) -> quote.profitPerAction)
+                        .thenComparingLong(quote -> -quote.costPerAction))
                 .orElse(null);
 
         if (best == null) {
             stoppedForNoProfit = true;
             activeRecipe = null;
             activeQuote = null;
-            stats.setStatus("No profitable Fletching recipe found for current level/prices");
-            logOccasionally("No profitable Fletching recipe available at level " + level
+            stats.setStatus("No priced Fletching recipe found for current level");
+            logOccasionally("No priced Fletching recipe available at level " + level
                     + ". Waiting before checking prices again.");
             Time.sleep(2500, 4000);
             nextRecipeRefreshAt = now + RECIPE_REFRESH_MS;
             return false;
         }
 
-        stoppedForNoProfit = false;
+        stoppedForNoProfit = !best.profitable();
         activeRecipe = best.recipe;
         activeQuote = best;
         nextRecipeRefreshAt = now + RECIPE_REFRESH_MS;
-        log("Selected recipe: " + activeRecipe.label
+        log((best.profitable() ? "Selected profitable recipe: " : "Selected cheapest-loss recipe: ")
+                + activeRecipe.label
                 + " profit/bow=" + activeQuote.profitPerAction
                 + " est/h=" + activeQuote.profitPerHour);
         return true;
@@ -362,10 +371,10 @@ public class FletchingProfitScript extends Script {
     }
 
     private void planRestock(APIContext ctx, FletchingRecipe recipe) {
-        if (activeQuote == null || !activeQuote.profitable()) {
+        if (activeQuote == null || !activeQuote.hasPrices()) {
             activeRecipe = null;
             nextRecipeRefreshAt = 0L;
-            stats.setStatus("Recipe no longer profitable; refreshing selection");
+            stats.setStatus("Recipe no longer priced; refreshing selection");
             return;
         }
 
