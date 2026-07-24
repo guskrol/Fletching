@@ -6,6 +6,7 @@ import com.epicbot.api.shared.entity.ItemWidget;
 import com.epicbot.api.shared.entity.WidgetChild;
 import com.epicbot.api.shared.event.ChatMessageEvent;
 import com.epicbot.api.shared.methods.IBankAPI;
+import com.epicbot.api.shared.methods.IEquipmentAPI;
 import com.epicbot.api.shared.methods.ITabsAPI;
 import com.epicbot.api.shared.model.ItemDetail;
 import com.epicbot.api.shared.model.Skill;
@@ -32,7 +33,7 @@ import java.util.concurrent.ThreadLocalRandom;
 
 @ScriptManifest(name = "Fletching Profit", gameType = GameType.OS)
 public class FletchingProfitScript extends Script {
-    private static final String SCRIPT_VERSION = "v0.2.4-direct-make-widget";
+    private static final String SCRIPT_VERSION = "v0.2.5-row-ge-gate";
     private static final Tile GRAND_EXCHANGE_TILE = new Tile(3164, 3487, 0);
     private static final int GE_MIN_X = 3150;
     private static final int GE_MAX_X = 3190;
@@ -154,6 +155,10 @@ public class FletchingProfitScript extends Script {
             }
 
             stats.startExperienceIfNeeded(ctx);
+
+            if (!ensureAtGrandExchangeBeforeAnyAction(ctx)) {
+                return;
+            }
 
             if (!pendingGeActions.isEmpty() || !placedGeActions.isEmpty()) {
                 handleGrandExchange(ctx);
@@ -1096,6 +1101,139 @@ public class FletchingProfitScript extends Script {
         return false;
     }
 
+    private boolean ensureAtGrandExchangeBeforeAnyAction(APIContext ctx) {
+        if (isAtGrandExchange(ctx)) {
+            return true;
+        }
+
+        if (ctx.localPlayer().isMoving() || ctx.localPlayer().isAnimating()) {
+            stats.setStatus("Waiting for ROW teleport to Grand Exchange");
+            Time.sleep(900, 1400, () -> isAtGrandExchange(ctx), 100);
+            return false;
+        }
+
+        if (ctx.grandExchange().isOpen()) {
+            stats.setStatus("Closing GE before ROW teleport");
+            ctx.grandExchange().close();
+            Time.sleep(600, 900, () -> !ctx.grandExchange().isOpen(), 100);
+            return false;
+        }
+
+        if (ctx.bank().isOpen()) {
+            stats.setStatus("Closing bank before ROW teleport");
+            ctx.bank().close();
+            Time.sleep(600, 900, () -> !ctx.bank().isOpen(), 100);
+            return false;
+        }
+
+        if (makeInterfaceOpen(ctx)) {
+            stats.setStatus("Closing make interface before ROW teleport");
+            ctx.widgets().closeInterface();
+            Time.sleep(500, 900, () -> !makeInterfaceOpen(ctx), 100);
+            return false;
+        }
+
+        if (clickGrandExchangeTeleportOption(ctx)) {
+            return false;
+        }
+
+        if (!ctx.tabs().isOpen(ITabsAPI.Tabs.EQUIPMENT)) {
+            stats.setStatus("Opening equipment tab for ROW teleport");
+            ctx.tabs().open(ITabsAPI.Tabs.EQUIPMENT);
+            Time.sleep(350, 700, () -> ctx.tabs().isOpen(ITabsAPI.Tabs.EQUIPMENT), 100);
+            return false;
+        }
+
+        ItemWidget ring = equippedRingOfWealth(ctx);
+        if (ring == null || !ring.isValid()) {
+            stats.setStatus("Not at GE and no equipped Ring of wealth found");
+            logOccasionally("Script is gated at startup: equip a charged Ring of wealth to teleport to GE.");
+            Time.sleep(1800, 2600);
+            return false;
+        }
+
+        stats.setStatus("Teleporting to GE with equipped ROW");
+        if (interactEquippedRowTeleport(ctx, ring)) {
+            Time.sleep(3500, 6500,
+                    () -> isAtGrandExchange(ctx)
+                            || ctx.localPlayer().isMoving()
+                            || ctx.localPlayer().isAnimating()
+                            || clickGrandExchangeTeleportOption(ctx),
+                    100);
+            return false;
+        }
+
+        logOccasionally("Could not use equipped ROW teleport. Ring actions=" + ring.getActions());
+        Time.sleep(900, 1400);
+        return false;
+    }
+
+    private ItemWidget equippedRingOfWealth(APIContext ctx) {
+        ItemWidget ringSlot = ctx.equipment().getItem(IEquipmentAPI.Slot.RING);
+        if (isRingOfWealth(ringSlot)) {
+            return ringSlot;
+        }
+        return ctx.equipment().getItem(this::isRingOfWealth);
+    }
+
+    private boolean isRingOfWealth(com.epicbot.api.shared.entity.Item item) {
+        return item != null
+                && item.isValid()
+                && normalizedName(item.getName()).startsWith("ringofwealth");
+    }
+
+    private boolean interactEquippedRowTeleport(APIContext ctx, ItemWidget ring) {
+        for (String action : rowGrandExchangeActions(ring)) {
+            if (ring.interact(action, ring.getName()) || ring.interact(action)) {
+                return true;
+            }
+        }
+        if (ring.interact("Rub", ring.getName()) || ring.interact("Rub")) {
+            Time.sleep(500, 900, () -> clickGrandExchangeTeleportOption(ctx), 100);
+            return true;
+        }
+        return false;
+    }
+
+    private List<String> rowGrandExchangeActions(ItemWidget ring) {
+        List<String> actions = new ArrayList<>();
+        for (String preferred : new String[]{"Grand Exchange", "GE"}) {
+            if (ring.hasAction(preferred)) {
+                actions.add(preferred);
+            }
+        }
+        for (String action : ring.getActions()) {
+            String normalized = normalizedName(action);
+            if ((normalized.contains("grandexchange")
+                    || normalized.equals("ge")
+                    || normalized.contains("exchange"))
+                    && !actions.contains(action)) {
+                actions.add(action);
+            }
+        }
+        if (actions.isEmpty()) {
+            actions.add("Grand Exchange");
+            actions.add("GE");
+        }
+        return actions;
+    }
+
+    private boolean clickGrandExchangeTeleportOption(APIContext ctx) {
+        WidgetChild option = findVisibleWidgetByText(ctx, "Grand Exchange");
+        if (option == null) {
+            return false;
+        }
+        stats.setStatus("Selecting ROW teleport option: Grand Exchange");
+        if (clickWidgetCenter(ctx, option)
+                || option.interact("Continue")
+                || option.interact("Select")
+                || option.click()) {
+            Time.sleep(900, 1600);
+            return true;
+        }
+        return false;
+    }
+
     private void handleGrandExchange(APIContext ctx) {
         if (ctx.bank().isOpen()) {
             ctx.bank().close();
@@ -1104,10 +1242,7 @@ public class FletchingProfitScript extends Script {
         }
 
         if (!isAtGrandExchange(ctx)) {
-            stats.setStatus("Walking to GE for restock/sales");
-            ctx.webWalking().setUseTeleports(true);
-            ctx.webWalking().walkTo(GRAND_EXCHANGE_TILE);
-            Time.sleep(1200, 1800);
+            ensureAtGrandExchangeBeforeAnyAction(ctx);
             return;
         }
 
