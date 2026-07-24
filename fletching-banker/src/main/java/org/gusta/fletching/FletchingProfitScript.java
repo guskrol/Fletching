@@ -2,6 +2,7 @@ package org.gusta.fletching;
 
 import com.epicbot.api.shared.APIContext;
 import com.epicbot.api.shared.GameType;
+import com.epicbot.api.shared.entity.Item;
 import com.epicbot.api.shared.entity.ItemWidget;
 import com.epicbot.api.shared.entity.WidgetChild;
 import com.epicbot.api.shared.event.ChatMessageEvent;
@@ -22,6 +23,13 @@ import com.epicbot.api.shared.util.time.Time;
 import java.awt.Color;
 import java.awt.Point;
 import java.awt.Rectangle;
+import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -33,7 +41,7 @@ import java.util.concurrent.ThreadLocalRandom;
 
 @ScriptManifest(name = "Fletching Profit", gameType = GameType.OS)
 public class FletchingProfitScript extends Script {
-    private static final String SCRIPT_VERSION = "v0.2.5-row-ge-gate";
+    private static final String SCRIPT_VERSION = "v0.2.6-watchdog";
     private static final Tile GRAND_EXCHANGE_TILE = new Tile(3164, 3487, 0);
     private static final int GE_MIN_X = 3150;
     private static final int GE_MAX_X = 3190;
@@ -46,6 +54,11 @@ public class FletchingProfitScript extends Script {
     private static final double BUY_MARKUP = 1.10D;
     private static final double SELL_MARKDOWN = 0.98D;
     private static final double GE_TAX_RATE = 0.02D;
+    private static final long WATCHDOG_GRACE_MS = 90_000L;
+    private static final long WATCHDOG_LOOP_MS = 120_000L;
+    private static final long WATCHDOG_INACTIVITY_MS = 480_000L;
+    private static final int WATCHDOG_LOOP_SAMPLE_THRESHOLD = 18;
+    private static final int WATCHDOG_HISTORY_LIMIT = 90;
     private static final String COINS = "Coins";
     private static final String BOW_STRING = "Bow string";
     private static final String[] CUTTING_TOOLS = {"Fletching knife", "Knife"};
@@ -56,6 +69,7 @@ public class FletchingProfitScript extends Script {
     private final List<GeAction> placedGeActions = new ArrayList<>();
     private final Map<String, Integer> lastInventoryUseIndexByName = new HashMap<>();
     private final Pricing pricing = new Pricing();
+    private final Watchdog watchdog = new Watchdog();
 
     private Stats stats;
     private FletchingRecipe activeRecipe;
@@ -69,6 +83,7 @@ public class FletchingProfitScript extends Script {
     @Override
     public boolean onStart(String... args) {
         stats = new Stats();
+        watchdog.reset();
         addTask(new FletchingTask());
         log("Fletching Profit " + SCRIPT_VERSION + " started");
         return true;
@@ -81,6 +96,7 @@ public class FletchingProfitScript extends Script {
         }
         String message = event.getMessage();
         stats.lastChat = message;
+        watchdog.note("CHAT " + message);
         String lower = message.toLowerCase();
         if (lower.contains("you do not have enough")
                 || lower.contains("not enough")
@@ -151,6 +167,10 @@ public class FletchingProfitScript extends Script {
             APIContext ctx = getAPIContext();
             if (ctx == null) {
                 Time.sleep(600, 900);
+                return;
+            }
+
+            if (!watchdog.guard(ctx)) {
                 return;
             }
 
@@ -1176,7 +1196,7 @@ public class FletchingProfitScript extends Script {
         return ctx.equipment().getItem(this::isRingOfWealth);
     }
 
-    private boolean isRingOfWealth(com.epicbot.api.shared.entity.Item item) {
+    private boolean isRingOfWealth(Item item) {
         return item != null
                 && item.isValid()
                 && normalizedName(item.getName()).startsWith("ringofwealth");
@@ -1695,6 +1715,7 @@ public class FletchingProfitScript extends Script {
         if (stats != null) {
             stats.setStatus(message);
         }
+        watchdog.note("LOG " + message);
         getLogger().info(message);
     }
 
@@ -1719,6 +1740,614 @@ public class FletchingProfitScript extends Script {
 
     private int clampToInt(long value) {
         return (int) Math.max(0L, Math.min(Integer.MAX_VALUE, value));
+    }
+
+    private class Watchdog {
+        private final DateTimeFormatter fileTimestamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
+        private final ArrayDeque<String> recentEvents = new ArrayDeque<>();
+        private final ArrayDeque<String> recentSamples = new ArrayDeque<>();
+        private final ArrayDeque<String> recentCoarseSignatures = new ArrayDeque<>();
+        private long startedAt;
+        private long lastProgressAt;
+        private long fineRepeatedSince;
+        private long coarseRepeatedSince;
+        private int fineRepeatedSamples;
+        private int coarseRepeatedSamples;
+        private String lastProgressSignature = "";
+        private String lastFineLoopSignature = "";
+        private String lastCoarseLoopSignature = "";
+        private boolean triggered;
+        private Path lastDumpPath;
+
+        private void reset() {
+            long now = System.currentTimeMillis();
+            startedAt = now;
+            lastProgressAt = now;
+            fineRepeatedSince = now;
+            coarseRepeatedSince = now;
+            fineRepeatedSamples = 0;
+            coarseRepeatedSamples = 0;
+            lastProgressSignature = "";
+            lastFineLoopSignature = "";
+            lastCoarseLoopSignature = "";
+            triggered = false;
+            lastDumpPath = null;
+            recentEvents.clear();
+            recentSamples.clear();
+            recentCoarseSignatures.clear();
+            note("WATCHDOG reset for " + SCRIPT_VERSION);
+        }
+
+        private void note(String message) {
+            if (message == null || message.isBlank()) {
+                return;
+            }
+            appendLimited(recentEvents, timestampNow() + " | " + message, WATCHDOG_HISTORY_LIMIT);
+        }
+
+        private boolean guard(APIContext ctx) {
+            if (triggered) {
+                Time.sleep(1200, 1800);
+                return false;
+            }
+            if (startedAt <= 0L) {
+                reset();
+            }
+
+            WatchdogSample sample = capture(ctx);
+            appendLimited(recentSamples, sample.line, WATCHDOG_HISTORY_LIMIT);
+            appendLimited(recentCoarseSignatures, sample.coarseLoopSignature, WATCHDOG_LOOP_SAMPLE_THRESHOLD * 2);
+            updateProgress(sample);
+            updateLoopCounters(sample);
+
+            long now = System.currentTimeMillis();
+            if (now - startedAt < WATCHDOG_GRACE_MS) {
+                return true;
+            }
+
+            String reason = watchdogReason(sample, now);
+            if (reason == null) {
+                return true;
+            }
+
+            trigger(ctx, reason, sample);
+            return false;
+        }
+
+        private void updateProgress(WatchdogSample sample) {
+            if (lastProgressSignature.equals(sample.progressSignature)) {
+                return;
+            }
+            lastProgressSignature = sample.progressSignature;
+            lastProgressAt = sample.timestamp;
+            note("PROGRESS " + sample.progressSummary);
+        }
+
+        private void updateLoopCounters(WatchdogSample sample) {
+            if (lastFineLoopSignature.equals(sample.fineLoopSignature)) {
+                fineRepeatedSamples++;
+            } else {
+                lastFineLoopSignature = sample.fineLoopSignature;
+                fineRepeatedSince = sample.timestamp;
+                fineRepeatedSamples = 1;
+            }
+
+            if (lastCoarseLoopSignature.equals(sample.coarseLoopSignature)) {
+                coarseRepeatedSamples++;
+            } else {
+                lastCoarseLoopSignature = sample.coarseLoopSignature;
+                coarseRepeatedSince = sample.timestamp;
+                coarseRepeatedSamples = 1;
+            }
+        }
+
+        private String watchdogReason(WatchdogSample sample, long now) {
+            long inactiveFor = now - lastProgressAt;
+            if (inactiveFor >= WATCHDOG_INACTIVITY_MS) {
+                return "No real progress for " + formatDuration(inactiveFor);
+            }
+
+            if (sample.expectedLongWait) {
+                return null;
+            }
+
+            String oscillationReason = oscillationReason(now);
+            if (oscillationReason != null) {
+                return oscillationReason;
+            }
+
+            long fineLoopFor = now - fineRepeatedSince;
+            if (fineRepeatedSamples >= WATCHDOG_LOOP_SAMPLE_THRESHOLD && fineLoopFor >= WATCHDOG_LOOP_MS) {
+                return "Same script state repeated for " + formatDuration(fineLoopFor)
+                        + " (" + fineRepeatedSamples + " samples)";
+            }
+
+            long coarseLoopFor = now - coarseRepeatedSince;
+            if (coarseRepeatedSamples >= WATCHDOG_LOOP_SAMPLE_THRESHOLD && coarseLoopFor >= WATCHDOG_LOOP_MS) {
+                return "Same account state repeated for " + formatDuration(coarseLoopFor)
+                        + " (" + coarseRepeatedSamples + " samples)";
+            }
+
+            return null;
+        }
+
+        private String oscillationReason(long now) {
+            long inactiveFor = now - lastProgressAt;
+            if (inactiveFor < WATCHDOG_LOOP_MS
+                    || recentCoarseSignatures.size() < WATCHDOG_LOOP_SAMPLE_THRESHOLD) {
+                return null;
+            }
+
+            Map<String, Integer> counts = new HashMap<>();
+            for (String signature : recentCoarseSignatures) {
+                counts.put(signature, counts.getOrDefault(signature, 0) + 1);
+            }
+            int repeatedSamples = 0;
+            for (int count : counts.values()) {
+                if (count > 1) {
+                    repeatedSamples += count;
+                }
+            }
+
+            if (counts.size() <= 4 && repeatedSamples >= WATCHDOG_LOOP_SAMPLE_THRESHOLD) {
+                return "Likely action loop: " + counts.size()
+                        + " account states repeated for " + formatDuration(inactiveFor)
+                        + " without productive progress";
+            }
+            return null;
+        }
+
+        private void trigger(APIContext ctx, String reason, WatchdogSample sample) {
+            triggered = true;
+            note("TRIGGER " + reason);
+            stats.setStatus("WATCHDOG logout: " + shortText(reason, 52));
+
+            closeBlockingInterfacesForWatchdog(ctx);
+
+            boolean logoutRequested = false;
+            String logoutError = "-";
+            try {
+                logoutRequested = ctx.game().logout();
+            } catch (RuntimeException ex) {
+                logoutError = ex.getClass().getSimpleName() + ": " + ex.getMessage();
+            }
+            Time.sleep(1600, 2800);
+            note("LOGOUT requested=" + logoutRequested
+                    + " gameState=" + safeGameState(ctx)
+                    + " error=" + logoutError);
+
+            Path dump = writeDiagnostic(ctx, reason, sample, logoutRequested, logoutError);
+            if (dump != null) {
+                log("WATCHDOG triggered; diagnostic saved at " + dump);
+            } else {
+                log("WATCHDOG triggered; diagnostic file could not be written");
+            }
+
+            try {
+                ctx.script().stop("Watchdog logout: " + reason);
+            } catch (RuntimeException ex) {
+                getLogger().warn("Watchdog could not stop script after logout", ex);
+            }
+        }
+
+        private void closeBlockingInterfacesForWatchdog(APIContext ctx) {
+            try {
+                clearClientInteractionState();
+                if (ctx.grandExchange().isOpen()) {
+                    ctx.grandExchange().close();
+                    Time.sleep(400, 700);
+                }
+                if (ctx.bank().isOpen()) {
+                    ctx.bank().close();
+                    Time.sleep(400, 700);
+                }
+                if (makeInterfaceOpen(ctx)) {
+                    ctx.widgets().closeInterface();
+                    Time.sleep(400, 700);
+                }
+            } catch (RuntimeException ex) {
+                note("WATCHDOG interface cleanup failed: " + ex.getClass().getSimpleName()
+                        + ": " + ex.getMessage());
+            }
+        }
+
+        private WatchdogSample capture(APIContext ctx) {
+            long now = System.currentTimeMillis();
+            String status = stats == null ? "-" : stats.status;
+            String recipe = activeRecipe == null ? "-" : activeRecipe.label;
+            String tile = safeTile(ctx);
+            String inventory = inventorySnapshot(ctx);
+            String equipment = equipmentSnapshot(ctx);
+            String ge = geSnapshot(ctx);
+            String selected = safeString("-", () -> ctx.inventory().getSelectedItemName());
+            boolean atGe = safeBoolean(false, () -> isAtGrandExchange(ctx));
+            boolean moving = safeBoolean(false, () -> ctx.localPlayer().isMoving());
+            boolean animating = safeBoolean(false, () -> ctx.localPlayer().isAnimating());
+            boolean bankOpen = safeBoolean(false, () -> ctx.bank().isOpen());
+            boolean geOpen = safeBoolean(false, () -> ctx.grandExchange().isOpen());
+            boolean makeOpen = safeBoolean(false, () -> makeInterfaceOpen(ctx));
+            boolean menuOpen = safeBoolean(false, () -> ctx.menu().isOpen());
+            int xp = safeInt(-1, () -> ctx.skills().get(Skill.Skills.FLETCHING).getExperience());
+            int processed = stats == null ? 0 : stats.processedActions;
+            int gameState = safeGameState(ctx);
+            int pending = pendingGeActions.size();
+            int placed = placedGeActions.size();
+            WorkStage stage = safeStage(ctx);
+            boolean expectedLongWait = placed > 0 && geOpen;
+
+            String progressSignature = "xp=" + xp
+                    + "|processed=" + processed
+                    + "|tile=" + tile
+                    + "|recipe=" + recipe
+                    + "|pending=" + pending
+                    + "|placed=" + placed
+                    + "|ge=" + ge;
+
+            String fineLoopSignature = "game=" + gameState
+                    + "|status=" + status
+                    + "|recipe=" + recipe
+                    + "|stage=" + stage
+                    + "|tile=" + tile
+                    + "|atGe=" + atGe
+                    + "|moving=" + moving
+                    + "|anim=" + animating
+                    + "|bank=" + bankOpen
+                    + "|geOpen=" + geOpen
+                    + "|make=" + makeOpen
+                    + "|menu=" + menuOpen
+                    + "|selected=" + selected
+                    + "|inv=" + inventory
+                    + "|pending=" + pending
+                    + "|placed=" + placed;
+
+            String coarseLoopSignature = "game=" + gameState
+                    + "|recipe=" + recipe
+                    + "|stage=" + stage
+                    + "|tile=" + tile
+                    + "|atGe=" + atGe
+                    + "|moving=" + moving
+                    + "|anim=" + animating
+                    + "|bank=" + bankOpen
+                    + "|geOpen=" + geOpen
+                    + "|make=" + makeOpen
+                    + "|menu=" + menuOpen
+                    + "|inv=" + inventory
+                    + "|pending=" + pending
+                    + "|placed=" + placed;
+
+            String progressSummary = "xp=" + xp
+                    + " actions=" + processed
+                    + " tile=" + tile
+                    + " recipe=" + recipe
+                    + " inv=" + shortText(inventory, 80)
+                    + " ge=" + shortText(ge, 80);
+
+            String line = timestampNow()
+                    + " | status=" + status
+                    + " | recipe=" + recipe
+                    + " | stage=" + stage
+                    + " | game=" + gameState
+                    + " | tile=" + tile
+                    + " | atGE=" + atGe
+                    + " | moving=" + moving
+                    + " | anim=" + animating
+                    + " | bank=" + bankOpen
+                    + " | geOpen=" + geOpen
+                    + " | make=" + makeOpen
+                    + " | menu=" + menuOpen
+                    + " | selected=" + selected
+                    + " | xp=" + xp
+                    + " | actions=" + processed
+                    + " | pending=" + pending
+                    + " | placed=" + placed
+                    + " | inv=" + inventory;
+
+            return new WatchdogSample(
+                    now,
+                    line,
+                    progressSignature,
+                    fineLoopSignature,
+                    coarseLoopSignature,
+                    progressSummary,
+                    expectedLongWait
+            );
+        }
+
+        private WorkStage safeStage(APIContext ctx) {
+            if (activeRecipe == null) {
+                return WorkStage.NONE;
+            }
+            try {
+                return nextInventoryStage(ctx, activeRecipe);
+            } catch (RuntimeException ignored) {
+                return WorkStage.NONE;
+            }
+        }
+
+        private Path writeDiagnostic(
+                APIContext ctx,
+                String reason,
+                WatchdogSample sample,
+                boolean logoutRequested,
+                String logoutError
+        ) {
+            try {
+                Path dir = watchdogLogDirectory(ctx);
+                Files.createDirectories(dir);
+                Path file = dir.resolve("fletching-watchdog-"
+                        + LocalDateTime.now().format(fileTimestamp)
+                        + "-" + Math.abs(System.currentTimeMillis() % 100_000L)
+                        + ".log");
+
+                List<String> lines = new ArrayList<>();
+                lines.add("Fletching Profit watchdog diagnostic");
+                lines.add("version=" + SCRIPT_VERSION);
+                lines.add("reason=" + reason);
+                lines.add("created=" + LocalDateTime.now());
+                lines.add("runtime=" + (stats == null ? "-" : stats.runtimeText()));
+                lines.add("logoutRequested=" + logoutRequested);
+                lines.add("logoutError=" + logoutError);
+                lines.add("gameStateAfterLogout=" + safeGameState(ctx));
+                lines.add("lastProgressAgo=" + formatDuration(System.currentTimeMillis() - lastProgressAt));
+                lines.add("fineLoopFor=" + formatDuration(System.currentTimeMillis() - fineRepeatedSince)
+                        + " samples=" + fineRepeatedSamples);
+                lines.add("coarseLoopFor=" + formatDuration(System.currentTimeMillis() - coarseRepeatedSince)
+                        + " samples=" + coarseRepeatedSamples);
+                lines.add("");
+                lines.add("Current script state");
+                lines.add("status=" + (stats == null ? "-" : stats.status));
+                lines.add("lastChat=" + (stats == null ? "-" : stats.lastChat));
+                lines.add("lastGeAction=" + (stats == null ? "-" : stats.lastGeAction));
+                lines.add("processedActions=" + (stats == null ? 0 : stats.processedActions));
+                lines.add("lastProcessedAt=" + (stats == null ? 0 : stats.lastProcessedAt));
+                lines.add("activeRecipe=" + (activeRecipe == null ? "-" : activeRecipe.label));
+                lines.add("activeQuote=" + activeQuoteSummary());
+                lines.add("pendingActions=" + geActionQueueText(pendingGeActions));
+                lines.add("placedActions=" + geActionQueueText(placedGeActions));
+                lines.add("");
+                lines.add("Trigger sample");
+                lines.add(sample.line);
+                lines.add("");
+                lines.add("Current snapshots");
+                lines.add("tile=" + safeTile(ctx));
+                lines.add("inventory=" + inventorySnapshot(ctx));
+                lines.add("equipment=" + equipmentSnapshot(ctx));
+                lines.add("ge=" + geSnapshot(ctx));
+                lines.add("makeWidgets=" + makeWidgetsSnapshot(ctx));
+                lines.add("rowActions=" + rowActionsSnapshot(ctx));
+                lines.add("");
+                lines.add("Recent events");
+                lines.addAll(recentEvents);
+                lines.add("");
+                lines.add("Recent samples");
+                lines.addAll(recentSamples);
+
+                Files.write(file, lines, StandardCharsets.UTF_8);
+                lastDumpPath = file;
+                return file;
+            } catch (IOException | RuntimeException ex) {
+                getLogger().error("Failed to write watchdog diagnostic", ex);
+                return null;
+            }
+        }
+
+        private Path watchdogLogDirectory(APIContext ctx) {
+            File base = null;
+            try {
+                base = ctx.script().getSettingsDirectory();
+            } catch (RuntimeException ignored) {
+                // Fall back below.
+            }
+            if (base == null) {
+                base = new File(System.getProperty("user.home"), "EpicBot");
+            }
+            return base.toPath().resolve("watchdog-logs");
+        }
+
+        private String activeQuoteSummary() {
+            if (activeQuote == null) {
+                return "-";
+            }
+            return "cost=" + activeQuote.costPerAction
+                    + " profit=" + activeQuote.profitPerAction
+                    + " profit/h=" + activeQuote.profitPerHour
+                    + " bows/h=" + activeQuote.bowsPerHour
+                    + " logsBuy=" + activeQuote.primaryBuyPrice
+                    + " stringBuy=" + activeQuote.secondaryBuyPrice
+                    + " outputSell=" + activeQuote.outputSellPrice;
+        }
+
+        private String geActionQueueText(Iterable<GeAction> actions) {
+            List<String> parts = new ArrayList<>();
+            for (GeAction action : actions) {
+                parts.add(action.describe());
+            }
+            return parts.isEmpty() ? "-" : String.join(" | ", parts);
+        }
+
+        private String rowActionsSnapshot(APIContext ctx) {
+            ItemWidget ring = safeItem(() -> equippedRingOfWealth(ctx));
+            if (ring == null) {
+                return "-";
+            }
+            return ring.getName() + " id=" + ring.getId() + " actions=" + ring.getActions();
+        }
+
+        private String makeWidgetsSnapshot(APIContext ctx) {
+            try {
+                List<String> parts = new ArrayList<>();
+                for (WidgetChild widget : makeInterfaceItemWidgets(ctx)) {
+                    parts.add("id=" + widget.getItemId()
+                            + " child=" + widget.getChildId()
+                            + " bounds=" + widget.getBounds()
+                            + " actions=" + widget.getActions()
+                            + " text='" + cleanWidgetText(visibleText(widget)) + "'");
+                }
+                return parts.isEmpty() ? "-" : String.join(" | ", parts);
+            } catch (RuntimeException ex) {
+                return "error:" + ex.getClass().getSimpleName() + ":" + ex.getMessage();
+            }
+        }
+
+        private String geSnapshot(APIContext ctx) {
+            return safeString("error", () -> {
+                if (!ctx.grandExchange().isOpen()) {
+                    return "closed";
+                }
+                List<String> parts = new ArrayList<>();
+                for (GrandExchangeSlot slot : ctx.grandExchange().getSlots()) {
+                    if (slot == null || !slot.inUse()) {
+                        continue;
+                    }
+                    GrandExchangeOffer offer = slot.getOffer();
+                    String item = offer == null ? "-" : offer.getItemName();
+                    int current = offer == null ? 0 : offer.getCurrentQuantity();
+                    int total = offer == null ? 0 : offer.getTotalQuantity();
+                    int price = offer == null ? 0 : offer.getPrice();
+                    parts.add(slot.getIndex() + ":" + slot.getState()
+                            + ":" + item + ":" + current + "/" + total + "@" + price
+                            + ":collect=" + slot.canCollect());
+                }
+                return parts.isEmpty() ? "open-empty" : String.join(",", parts);
+            });
+        }
+
+        private String inventorySnapshot(APIContext ctx) {
+            return safeString("error", () -> itemWidgetsSnapshot(ctx.inventory().getItems()));
+        }
+
+        private String equipmentSnapshot(APIContext ctx) {
+            return safeString("error", () -> itemWidgetsSnapshot(ctx.equipment().getItems()));
+        }
+
+        private String itemWidgetsSnapshot(List<ItemWidget> items) {
+            List<ItemWidget> sorted = new ArrayList<>(items);
+            sorted.sort(Comparator.comparingInt(ItemWidget::getIndex));
+            List<String> parts = new ArrayList<>();
+            for (ItemWidget item : sorted) {
+                if (item == null || !item.isValid() || item.getName() == null || item.getName().isBlank()) {
+                    continue;
+                }
+                parts.add(item.getIndex()
+                        + ":" + item.getId()
+                        + ":" + normalizedName(item.getName())
+                        + "x" + item.getStackSize());
+            }
+            return parts.isEmpty() ? "empty" : String.join(",", parts);
+        }
+
+        private String safeTile(APIContext ctx) {
+            return safeString("-", () -> {
+                Tile tile = ctx.localPlayer().getLocation();
+                if (tile == null) {
+                    return "-";
+                }
+                return tile.getX() + "," + tile.getY() + "," + tile.getPlane();
+            });
+        }
+
+        private int safeGameState(APIContext ctx) {
+            return safeInt(-1, () -> ctx.game().getGameState().getState());
+        }
+
+        private ItemWidget safeItem(ItemSupplier supplier) {
+            try {
+                return supplier.get();
+            } catch (RuntimeException ex) {
+                return null;
+            }
+        }
+
+        private String safeString(String fallback, StringSupplier supplier) {
+            try {
+                String value = supplier.get();
+                return value == null ? fallback : value;
+            } catch (RuntimeException ex) {
+                return fallback + "(" + ex.getClass().getSimpleName() + ")";
+            }
+        }
+
+        private int safeInt(int fallback, IntSupplier supplier) {
+            try {
+                return supplier.get();
+            } catch (RuntimeException ex) {
+                return fallback;
+            }
+        }
+
+        private boolean safeBoolean(boolean fallback, BooleanSupplier supplier) {
+            try {
+                return supplier.get();
+            } catch (RuntimeException ex) {
+                return fallback;
+            }
+        }
+
+        private void appendLimited(ArrayDeque<String> deque, String value, int limit) {
+            deque.addLast(value);
+            while (deque.size() > limit) {
+                deque.removeFirst();
+            }
+        }
+
+        private String timestampNow() {
+            return LocalDateTime.now().toString();
+        }
+
+        private String formatDuration(long millis) {
+            long seconds = Math.max(0L, millis / 1000L);
+            long minutes = seconds / 60L;
+            long remainingSeconds = seconds % 60L;
+            return minutes + "m " + remainingSeconds + "s";
+        }
+    }
+
+    private static class WatchdogSample {
+        private final long timestamp;
+        private final String line;
+        private final String progressSignature;
+        private final String fineLoopSignature;
+        private final String coarseLoopSignature;
+        private final String progressSummary;
+        private final boolean expectedLongWait;
+
+        private WatchdogSample(
+                long timestamp,
+                String line,
+                String progressSignature,
+                String fineLoopSignature,
+                String coarseLoopSignature,
+                String progressSummary,
+                boolean expectedLongWait
+        ) {
+            this.timestamp = timestamp;
+            this.line = line;
+            this.progressSignature = progressSignature;
+            this.fineLoopSignature = fineLoopSignature;
+            this.coarseLoopSignature = coarseLoopSignature;
+            this.progressSummary = progressSummary;
+            this.expectedLongWait = expectedLongWait;
+        }
+    }
+
+    @FunctionalInterface
+    private interface StringSupplier {
+        String get();
+    }
+
+    @FunctionalInterface
+    private interface IntSupplier {
+        int get();
+    }
+
+    @FunctionalInterface
+    private interface BooleanSupplier {
+        boolean get();
+    }
+
+    @FunctionalInterface
+    private interface ItemSupplier {
+        ItemWidget get();
     }
 
     private enum WorkStage {
@@ -1992,7 +2621,7 @@ public class FletchingProfitScript extends Script {
         }
     }
 
-    private static class Stats {
+    private class Stats {
         private final long startedAt = System.currentTimeMillis();
         private int startingFletchingXp = -1;
         private int processedActions;
@@ -2032,7 +2661,11 @@ public class FletchingProfitScript extends Script {
         }
 
         private void setStatus(String status) {
-            this.status = status == null ? "-" : status;
+            String next = status == null ? "-" : status;
+            if (!next.equals(this.status)) {
+                this.status = next;
+                watchdog.note("STATUS " + next);
+            }
         }
     }
 }
